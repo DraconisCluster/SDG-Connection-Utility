@@ -57,7 +57,7 @@ guaranteed.
   runtime so no Node install is required. Target server is read at
   run time from `config.txt`, so it can be rotated without rebuilding
   the bundle. Build script lives at [`tools/build-bundle.py`](tools/build-bundle.py)
-  and produces `sdg-connection-test-<version>-windows-x64.zip` (~31.6
+  and produces `sdg-connection-utility-<version>-windows-x64.zip` (~31.6
   MiB).
 
 ### Fixed
@@ -276,7 +276,7 @@ First public release.
   under absurd `--duration` values; the cap is well above any
   legitimate diagnostic use.
 
-[Unreleased]: https://github.com/sdg-net/sdg-connection-test/compare/v1.2.0...HEAD
-[1.2.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.2.0
-[1.1.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.1.0
-[1.0.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.0.0
+[Unreleased]: https://github.com/DraconisCluster/SDG-Connection-Utility/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.2.0
+[1.1.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.1.0
+[1.0.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.0.0

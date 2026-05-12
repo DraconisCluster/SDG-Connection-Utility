@@ -1761,7 +1761,7 @@ async function runTests(opts) {
 
   const report = {
     version: 1,
-    tool: 'sdg-connection-test client',
+    tool: 'sdg-connection-utility client',
     startedAt: new Date().toISOString(),
     host, resolved, family,
     nonceHex: toHex(nonce),

@@ -14,13 +14,13 @@ do, and tells you how to verify that for yourself.
 ## TL;DR — how to run it
 
 > **Just want to run the test on Windows without installing Node?** Grab
-> `sdg-connection-test-vX.Y.Z-windows-x64.zip` from the [latest GitHub
-> Release](https://github.com/sdg-net/sdg-connection-test/releases/latest)
+> `sdg-connection-utility-vX.Y.Z-windows-x64.zip` from the [latest GitHub
+> Release](https://github.com/DraconisCluster/SDG-Connection-Utility/releases/latest)
 > instead, unzip, and double-click `Run-Test.cmd`. Skip the rest of this
 > section. The instructions below are the source / developer path.
 
 1. Install [Node.js 20 or later](https://nodejs.org/en/download) (LTS is fine).
-2. Download the source-only `sdg-connection-test-vX.Y.Z.zip` from
+2. Download the source-only `sdg-connection-utility-vX.Y.Z.zip` from
    <https://sdg.knowledgeondemand.net> (or the latest GitHub Release) and unzip it.
 3. Open a terminal (PowerShell, cmd, or bash) in the unzipped folder.
 4. Run:

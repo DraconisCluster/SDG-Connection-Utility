@@ -104,17 +104,15 @@ situation:
 | | **Windows easy-install** | **Source / developer** |
 | --- | --- | --- |
 | For | End users, players debugging connection issues, support tickets, non-technical staff | Auditing, contributors, Linux / macOS, anyone running against their own test endpoint |
-| Asset | `sdg-connection-test-vX.Y.Z-windows-x64.zip` (~32 MiB) | `sdg-connection-test-vX.Y.Z.zip` (~100 KB) |
+| Asset | `sdg-connection-utility-vX.Y.Z-windows-x64.zip` (~32 MiB) | `sdg-connection-utility-vX.Y.Z.zip` (~100 KB) |
 | Includes | Pre-bundled Node.js 22 LTS runtime, double-click launcher | Source only — bring your own Node 20+ |
 | To run | Double-click `Run-Test.cmd`; report lands in the same folder | `node client/client.js --yes` (defaults to `38.107.232.39`) |
 
-Both are attached to every [GitHub Release](https://github.com/sdg-net/sdg-connection-test/releases/latest).
-Customer-facing download portal: <https://sdg.knowledgeondemand.net>
 
 ### Windows easy-install (recommended for end users)
 
-1. Download `sdg-connection-test-vX.Y.Z-windows-x64.zip` from the
-   [latest release](https://github.com/sdg-net/sdg-connection-test/releases/latest).
+1. Download `sdg-connection-utility-vX.Y.Z-windows-x64.zip` from the
+   [latest release](https://github.com/DraconisCluster/SDG-Connection-Utility/releases/latest).
 2. Right-click → **Extract All**.
 3. Open the extracted folder and double-click `Run-Test.cmd`. A console
    window opens.
@@ -133,8 +131,8 @@ something you need to touch.
 ```
 # Either: download the source-only zip from the latest release and unzip,
 # or:
-git clone https://github.com/sdg-net/sdg-connection-test.git
-cd sdg-connection-test/client
+git clone https://github.com/DraconisCluster/SDG-Connection-Utility.git
+cd SDG-Connection-Utility/client
 node client.js --yes
 ```
 

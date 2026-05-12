@@ -1,0 +1,6 @@
+# Build artifacts produced by tools/build-bundle.py
+/dist/
+/tools/cache/
+
+# Local node_modules (project is zero-dep, but in case anyone runs npm)
+node_modules/

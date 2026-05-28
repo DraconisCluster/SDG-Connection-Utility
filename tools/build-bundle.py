@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Build the Windows easy-install bundle for the SDG Connection Test.
 
-Produces: dist/sdg-connection-utility-<version>-windows-x64.zip
+Produces: dist/sdg-connection-test-<version>-windows-x64.zip
 
 Layout (slim — non-technical customer:
 
-  sdg-connection-utility/
+  sdg-connection-test/
     README - START HERE.txt
     Run-Test.cmd
     config.txt
@@ -195,13 +195,13 @@ def main() -> int:
         version = "v" + version
 
     out_zip = Path(args.output) if args.output else (
-        DIST_DIR / f"sdg-connection-utility-{version}-windows-x64.zip"
+        DIST_DIR / f"sdg-connection-test-{version}-windows-x64.zip"
     )
 
     stage_parent = DIST_DIR / "_stage"
     if stage_parent.exists():
         shutil.rmtree(stage_parent)
-    top_dir_name = "sdg-connection-utility"
+    top_dir_name = "sdg-connection-test"
     stage_root = stage_parent / top_dir_name
 
     print(f"[build] version      : {version}")

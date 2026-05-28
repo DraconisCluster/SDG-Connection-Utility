@@ -109,8 +109,8 @@ Instead, we:
      after 30 s and 60 s of idle (or up to 300 s with `--full`). The
      reflected source port is compared before and after each idle
      window to detect carrier NAT mapping eviction even when the
-     data path appears to recover. Covers the most common T-Mobile
-     5G Home failure mode.
+     data path appears to recover. Covers the most common 5G home
+     internet failure mode.
    - **Endpoint reflection / NAT type** — sends two probes from one
      socket to two destinations and compares the source port the
      server reports observing. Same port → cone NAT (peer-to-peer
@@ -123,8 +123,8 @@ Instead, we:
    - **Bidirectional sustained stream** — the legacy sustained test
      was downstream-only. The bidirectional variant adds a
      client-emits-server-tallies upstream phase so uplink-only
-     throttling (T-Mobile's uplink path is a separately-shaped
-     device) becomes visible. The server replies with a single
+     throttling (5G home internet uplinks are commonly a separately-
+     shaped path) becomes visible. The server replies with a single
      small tally packet (sent three times for loss tolerance).
    - **Burst-vs-steady policer test** — 100 packets as fast as the
      OS will let us, then 100 packets at 10 pps. Comparing the loss
@@ -179,6 +179,41 @@ ever completed a real SteamNetworkingSockets handshake.
   server support at all.
 - They do not communicate with anything other than `--host`.
   The privacy boundary is unchanged from v1.0.0.
+
+## Adaptive MTU discovery and the recommendation engine
+
+The client also runs an **adaptive MTU discovery** pass against the
+critical SE game port (UDP 27016) and a **recommendation engine** over
+the assembled report. Both deserve a transparency note.
+
+- **MTU discovery** walks the standard UDP payload sizes downward from
+  1472 bytes (the max that fits in a 1500-byte ethernet frame) to 576
+  bytes (the IPv4 minimum), stopping at the first size that
+  round-trips. The probes themselves are the same SDGT protocol packets
+  documented in [PROTOCOL.md](./PROTOCOL.md) — only the payload size
+  changes. No new wire format, no new data exfiltrated. If 27016 itself
+  is unreachable, discovery falls back to 8766 → 27015 → 27443 in
+  order, again using identical SDGT probes. Total extra bytes on the
+  wire: roughly 30 probes worth in the typical case, well under what
+  the existing per-port loss tests already send.
+
+- **Recommendation engine** is a pure local computation over the
+  report object that you already see. It does not contact the server,
+  does not read files, does not access environment variables. It emits
+  structured `recommendations` entries with stable codes (`mtu-capped`,
+  `dpi-fingerprint`, `test-inconclusive`, etc.) and per-OS shell
+  commands you can copy-paste to apply a suggested fix (e.g. lowering
+  your adapter MTU with `netsh interface ipv4 set subinterface
+  ... mtu=1280 ...`). These commands are **suggestions in plain text** —
+  the client does not run them, does not modify your system, and the
+  raw text is in the JSON report so you can audit exactly what it
+  would have you do before doing it.
+
+- **The recommendation engine does not learn anything new about you.**
+  Each rule is a pure function `(report) -> Recommendation | null`
+  that reads only fields already in the report. The same input always
+  produces the same output. Source code: search `client.js` for
+  `function rule` and `const RULES =`.
 
 ## Anything we missed?
 

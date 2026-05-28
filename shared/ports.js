@@ -14,7 +14,8 @@
 'use strict';
 
 const PORTS = Object.freeze([
-  // --- critical: the ones T-Mobile is suspected of eating ---
+  // --- critical: the SE/Steam ports most often eaten by carrier
+  //     shaping on 5G home internet ---
   { proto: 'udp', port: 27016, category: 'critical', purpose: 'Space Engineers dedicated server (default game port)' },
   { proto: 'udp', port: 8766,  category: 'critical', purpose: 'Steam master server traffic from SE' },
   { proto: 'udp', port: 27015, category: 'critical', purpose: 'Steam/SRCDS query (A2S_INFO)' },

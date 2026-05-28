@@ -28,6 +28,12 @@ test('defaults: no flags → host=SDG public IP, sustained=true, a2s=true, famil
   assert.equal(o.family, 0, 'family 0 = OS auto by default');
   assert.equal(o.duration, 10_000, 'default sustained test duration is 10s');
   assert.equal(o.help, false);
+  assert.equal(o.mtuDiscovery, true, 'adaptive MTU discovery is on by default');
+});
+
+test('--no-mtu-discovery flips mtuDiscovery=false', () => {
+  const o = parseArgs(['--no-mtu-discovery']);
+  assert.equal(o.mtuDiscovery, false);
 });
 
 test('--host captures the next argv', () => {

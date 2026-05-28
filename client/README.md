@@ -14,13 +14,13 @@ do, and tells you how to verify that for yourself.
 ## TL;DR — how to run it
 
 > **Just want to run the test on Windows without installing Node?** Grab
-> `sdg-connection-utility-vX.Y.Z-windows-x64.zip` from the [latest GitHub
-> Release](https://github.com/DraconisCluster/SDG-Connection-Utility/releases/latest)
+> `sdg-connection-test-vX.Y.Z-windows-x64.zip` from the [latest GitHub
+> Release](https://github.com/sdg-net/sdg-connection-test/releases/latest)
 > instead, unzip, and double-click `Run-Test.cmd`. Skip the rest of this
 > section. The instructions below are the source / developer path.
 
 1. Install [Node.js 20 or later](https://nodejs.org/en/download) (LTS is fine).
-2. Download the source-only `sdg-connection-utility-vX.Y.Z.zip` from
+2. Download the source-only `sdg-connection-test-vX.Y.Z.zip` from
    <https://sdg.knowledgeondemand.net> (or the latest GitHub Release) and unzip it.
 3. Open a terminal (PowerShell, cmd, or bash) in the unzipped folder.
 4. Run:
@@ -62,7 +62,7 @@ node client/client.js --help
 Every outbound packet is one of exactly two shapes:
 
 1. **An SDG Connection Test probe** — a 36-byte binary header (plus optional
-   zero padding up to 1400 bytes for the MTU test) containing:
+   zero padding up to 1472 bytes for the adaptive MTU discovery) containing:
    - The four ASCII bytes `SDGT`
    - A version byte (`0x01`)
    - A type byte. Client-emitted types are `0x01` (probe),
@@ -141,13 +141,15 @@ Choose one or more of:
 | Reachability | Every (proto, port) in the table | One packet round-trips within 2 seconds |
 | Loss rate | Every UDP port | 50 packets at 10 pps, % received |
 | Latency stats | Every UDP port | min / avg / p95 / max / stddev RTT |
-| MTU / large packet | Every UDP port | A 1400-byte packet still round-trips |
+| Adaptive MTU discovery | Critical UDP port (27016) | Walks payload sizes 1472 → 1400 → 1300 → ... → 576 to find the actual MTU ceiling. Stops at the first size that round-trips. Falls back to alternate target ports if 27016 itself is unreachable. |
+| MTU spot-check at ceiling | Every reachable UDP port | Parallel single probe at the discovered ceiling. Flags `portSpecificShaping` if any port fails at a size the discovery port proved works. |
+| Recommendation engine | All collected data (post-test) | Pure local computation. Emits structured recommendations with stable codes (`mtu-capped`, `dpi-fingerprint`, etc.) and platform-specific copy-paste fix commands. No new packets, no I/O. |
 | Steam A2S query | UDP 27015 | A real Source-engine query gets a real reply — the same thing the Steam server browser does |
 | Game-shape sustained | UDP 27016 | The server pushes ~60 pps, 200-400 byte packets for 10 seconds. Measures how many you receive and whether there are any gaps larger than 250 ms (the signature of ISP shaping/throttling) |
 | `--real-server` A2S (opt-in) | Your Torch server | Sends an A2S query to the actual server you are trying to play on, for side-by-side comparison |
-| NAT idle-timeout (`--nat-idle`) | UDP 27016 | Holds one socket open and probes the path after 30/60/120/300 seconds of idle to find when your carrier's NAT mapping gets evicted. Most likely culprit for "I get disconnected after a few minutes" reports on T-Mobile 5G Home. |
+| NAT idle-timeout (`--nat-idle`) | UDP 27016 | Holds one socket open and probes the path after 30/60/120/300 seconds of idle to find when your carrier's NAT mapping gets evicted. Most likely culprit for "I get disconnected after a few minutes" reports on 5G home internet. |
 | NAT type / endpoint reflection (`--nat-type`) | UDP 27016 + 27017 | Asks the server what source port it observed on each of two destinations. Tells you whether your NAT is "cone" (peer-to-peer works) or "symmetric" (peer-to-peer needs a relay like Steam Datagram). |
-| Bidirectional sustained (`--bidir up\|both`) | UDP 27016 | Same shape as the standard sustained test but in the upload direction (or both). Detects uplink-only throttling, which T-Mobile's uplink can do independently of downlink. |
+| Bidirectional sustained (`--bidir up\|both`) | UDP 27016 | Same shape as the standard sustained test but in the upload direction (or both). Detects uplink-only throttling, which 5G home internet uplinks can do independently of downlink. |
 | Burst-vs-steady (`--burst`) | UDP 27443 (baseline) | 100 packets as fast as the kernel will let us, then 100 at 10 pps. Compares loss patterns to fingerprint a policer (token bucket — burst eaten, steady fine), a shaper (loss at both rates), or random loss. |
 | Source-port fan-out | UDP 27016 | Sends a short loss test from 4 different ephemeral source ports. Diverging loss across source ports indicates per-5-tuple shaping or an unlucky ECMP hash bucket on a carrier router. |
 | Payload-shape sensitivity | UDP 27016 | Three loss tests with different payload contents (game-shape, random, zero-fill). Diverging loss indicates DPI making content-based decisions. |
@@ -161,11 +163,15 @@ Choose one or more of:
 - **`rtt(ms)`** — average RTT for UDP (from the loss test) or the single
   round-trip time for TCP.
 - **`loss%`** — percentage of probes that did not come back (UDP only).
-- **`mtu`** — the largest probe size (in bytes) that round-tripped on
-  this UDP port. The MTU sweep tries 1200, 1400, and 1472 — ideal is
-  `1472`, acceptable is `1400`, and `1200` (or `FAIL`) means the ISP
-  is clamping MTU or mangling large UDP packets, which is a known
-  T-Mobile 5G Home pattern.
+- **`mtu`** — the ceiling discovered by the adaptive MTU sweep on the
+  critical SE game port (UDP 27016), spot-checked on every reachable
+  UDP port. Ideal is `1472`, acceptable is `1400`, and anything below
+  `1300` (or `FAIL`) means the ISP is clamping MTU or mangling large
+  UDP packets — a known pattern on 5G home internet across all major
+  US providers due to mobile sub-tunnel encapsulation overhead. See
+  the RECOMMENDATIONS section in the console output (or the
+  `recommendations` field in the JSON report) for the exact remediation
+  command for your OS.
 - **Game-shape line** — look for `[THROTTLING SIGNAL]`. That appears when
   any inter-packet gap in the 10-second sustained test exceeds 250 ms,
   which is well above normal network jitter and suggests active traffic
@@ -204,6 +210,9 @@ idle ladder.
 --no-burst               Skip the burst-vs-steady policer test.
 --no-source-fanout       Skip the source-port fan-out test.
 --no-payload-shape       Skip the payload-shape sensitivity test.
+--no-mtu-discovery       Skip adaptive MTU discovery + spot-check. Use
+                         when --ports filters out all critical UDP ports,
+                         or when you only care about reachability.
 --bidir <down|up|both>   Sustained test direction. Default 'both'
                          (downstream + upstream). Pass 'down' for the
                          legacy v1.0.0 behavior.

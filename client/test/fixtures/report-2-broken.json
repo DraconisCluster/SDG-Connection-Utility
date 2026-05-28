@@ -1,0 +1,41 @@
+{
+  "version": 2,
+  "tool": "sdg-connection-test client",
+  "startedAt": "2026-05-28T05:48:00.597Z",
+  "host": "38.107.232.39",
+  "resolved": "38.107.232.39",
+  "family": 4,
+  "nonceHex": "d602a5d597e87dc2",
+  "capabilities": {
+    "ok": false,
+    "reason": "timeout",
+    "capabilities": null,
+    "isV1Server": false
+  },
+  "mtuDiscovery": {
+    "ok": true,
+    "discoveredOn": 27016,
+    "descent": [],
+    "ceiling": null,
+    "ceilingConfidence": "none",
+    "reason": "no-reachable-discovery-port"
+  },
+  "perPort": [
+    { "proto": "udp", "port": 27016, "category": "critical", "purpose": "SE game", "reachable": false },
+    { "proto": "udp", "port": 8766,  "category": "critical", "purpose": "Steam",   "reachable": false },
+    { "proto": "udp", "port": 27015, "category": "critical", "purpose": "A2S",     "reachable": false },
+    { "proto": "udp", "port": 27017, "category": "game",     "purpose": "SE alt",  "reachable": false },
+    { "proto": "udp", "port": 27020, "category": "game",     "purpose": "Torch",   "reachable": true,  "loss": { "lossPct": 100 } },
+    { "proto": "udp", "port": 27031, "category": "steam",    "purpose": "Steam",   "reachable": false },
+    { "proto": "udp", "port": 3478,  "category": "steam",    "purpose": "STUN",    "reachable": false },
+    { "proto": "udp", "port": 4379,  "category": "steam",    "purpose": "Datagram","reachable": false },
+    { "proto": "udp", "port": 4380,  "category": "steam",    "purpose": "Datagram","reachable": false },
+    { "proto": "tcp", "port": 27015, "category": "steam",    "purpose": "Steam tcp","reachable": false },
+    { "proto": "udp", "port": 27443, "category": "baseline", "purpose": "baseline","reachable": false }
+  ],
+  "natIdle": null,
+  "natType": null,
+  "sourcePortFanout": { "verdict": { "kind": "per-flow", "reason": "loss varies 100% across source ports" } },
+  "payloadShape": { "verdict": { "kind": "dpi-fingerprint", "reason": "zero-fill 100% vs cleaner peers" } },
+  "deprecated": ["perPort[].mtuSweep"]
+}

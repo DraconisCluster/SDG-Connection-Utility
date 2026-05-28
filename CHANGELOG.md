@@ -16,6 +16,72 @@ guaranteed.
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-05-28
+
+### Added
+- **Adaptive MTU discovery on the critical SE game port (UDP 27016).**
+  Replaces the legacy fixed `[1200, 1400, 1472]` per-port sweep with
+  a linear descent from 1472 down through 1400, 1300, 1280, 1200,
+  1100, 1000, 900, 800, 576 — stopping at the first size that
+  round-trips. Names the actual MTU ceiling on carrier-clamped paths
+  (a common pattern on 5G home internet across major US providers,
+  where the mobile sub-tunnel adds encapsulation overhead that eats
+  100-200 bytes off the standard ethernet MTU). Fast-fails to the
+  smallest size after 2 consecutive size failures so a fully broken
+  network bounds discovery time. Falls back to alternate target ports
+  (8766 → 27015 → 27443) if 27016 itself is unreachable. IPv6 descent
+  starts 20 bytes lower (1452).
+- **Parallel MTU spot-check on every reachable UDP port** at the
+  discovered ceiling. Different destination ports = different
+  5-tuples = no reply confusion. Distinguishes path-wide MTU clamp
+  from per-port shaping (`row.portSpecificShaping`).
+- **Recommendation engine** that interprets the assembled report and
+  emits structured remediation suggestions with platform-specific
+  shell commands (Windows `netsh`, macOS `ifconfig`, Linux `ip`).
+  Stable recommendation codes: `mtu-capped`, `mtu-severe`,
+  `mtu-marginal`, `cgnat-464xlat`, `test-inconclusive`,
+  `dpi-fingerprint`, `per-flow-shaping`, `nat-idle-short`,
+  `symmetric-nat`, `network-healthy`. Output is in a new
+  `RECOMMENDATIONS` console section and a top-level `recommendations`
+  field in the JSON report.
+- **`TEST INCONCLUSIVE` banner** printed ABOVE the per-port table
+  when >50% of attempted UDP ports were unreachable. Customers were
+  pattern-matching on the green/red table without realizing the test
+  server itself was unreachable; the banner makes the inconclusive
+  state unmissable.
+- **`--no-mtu-discovery` flag** to skip the new discovery phase
+  (matches the existing `--no-sustained` / `--no-a2s` / `--no-burst`
+  opt-out pattern).
+- **`mtuDiscovery` top-level JSON field** carrying the full descent
+  history, discovered ceiling, ceiling confidence, fallback target
+  used, and reasons for any skip.
+- **`perPort[].mtuAtCeiling`** per-UDP-row field carrying the
+  spot-check result `{ size, ok, rtt, probes }` and an optional
+  `portSpecificShaping: true` flag when the spot-check fails at the
+  discovered ceiling on a specific port.
+
+### Changed
+- **Report format bumped to version 2** (`report.version === 2`).
+  The wire format is unchanged — this is a report-schema bump only.
+- **Per-port table MTU column** now reflects the spot-check at the
+  discovered ceiling rather than the largest size in a fixed 3-size
+  sweep. A new "MTU ceiling discovered" line appears above the table
+  with the pass/fail counts at the ceiling and the size immediately
+  above it.
+- **Generalized carrier-specific language** in documentation and
+  code comments. The diagnostic patterns the tool catches (CGNAT
+  idle eviction, MTU clamping, uplink throttling) apply across all
+  major 5G home internet providers, not a single brand, so the docs
+  now reflect that.
+
+### Deprecated
+- **`perPort[].mtuSweep`** — still populated as a one-element array
+  containing the spot-check result so existing `jq` queries don't
+  break, but will be removed in v1.4.0. Use
+  `perPort[].mtuAtCeiling` going forward. `report.deprecated`
+  lists currently-deprecated field paths so support staff can grep
+  for migration work.
+
 ## [1.2.1] — 2026-05-10
 
 ### Added
@@ -57,7 +123,7 @@ guaranteed.
   runtime so no Node install is required. Target server is read at
   run time from `config.txt`, so it can be rotated without rebuilding
   the bundle. Build script lives at [`tools/build-bundle.py`](tools/build-bundle.py)
-  and produces `sdg-connection-utility-<version>-windows-x64.zip` (~31.6
+  and produces `sdg-connection-test-<version>-windows-x64.zip` (~31.6
   MiB).
 
 ### Fixed
@@ -276,7 +342,7 @@ First public release.
   under absurd `--duration` values; the cap is well above any
   legitimate diagnostic use.
 
-[Unreleased]: https://github.com/DraconisCluster/SDG-Connection-Utility/compare/v1.2.0...HEAD
-[1.2.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.2.0
-[1.1.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.1.0
-[1.0.0]: https://github.com/DraconisCluster/SDG-Connection-Utility/releases/tag/v1.0.0
+[Unreleased]: https://github.com/sdg-net/sdg-connection-test/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.2.0
+[1.1.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.1.0
+[1.0.0]: https://github.com/sdg-net/sdg-connection-test/releases/tag/v1.0.0

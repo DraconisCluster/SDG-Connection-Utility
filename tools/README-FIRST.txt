@@ -14,12 +14,18 @@ HOW TO RUN IT
   2. Double-click "Run-Test.cmd" in this folder.
   3. A black window opens and runs for about 3 to 4 minutes.
      DO NOT close it - it closes itself when finished.
-  4. When it finishes you'll see a line like this:
+  4. Toward the end you'll see a "RECOMMENDATIONS" section. If your
+     network has any actionable issues (e.g. MTU clamping on 5G home
+     internet) it lists them with a ready-to-copy fix command for
+     Windows. Read those first - sometimes the fix is one line you
+     can paste into an admin Command Prompt and the problem goes away.
+  5. When it finishes you'll see a line like this:
             Report saved to:
               <this folder>\sdg-test-report-...json
      The report file appears RIGHT NEXT TO Run-Test.cmd in this same
      folder.
-  5. Attach that .json file to your SDG support ticket.
+  6. Attach that .json file to your SDG support ticket. If a
+     recommendation suggested a fix, mention whether you tried it.
 
   That's it. You're done.
 
@@ -59,8 +65,13 @@ TROUBLESHOOTING
 PRIVACY
 -------
   The report file contains: per-port test results (round-trip time,
-  packet loss, MTU), NAT type, and a REDACTED form of your public IP
-  (e.g. "1.2.3.x" - the last octet is dropped). It does NOT contain
-  personal files, browsing history, or anything outside this
-  connection test. You can open the report in any text editor before
-  sending it - it's plain JSON.
+  packet loss, MTU ceiling), NAT type, the recommendation engine's
+  output (a list of issues found plus suggested fix commands), and a
+  REDACTED form of your public IP (e.g. "1.2.3.x" - the last octet
+  is dropped). It does NOT contain personal files, browsing history,
+  or anything outside this connection test. You can open the report
+  in any text editor before sending it - it's plain JSON.
+
+  The "fix commands" in the recommendations are just text - the tool
+  itself never runs them or modifies your system. You read them and
+  decide whether to run them yourself.

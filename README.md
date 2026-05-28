@@ -21,10 +21,30 @@ its hardening details are operator-internal.
 
 ### Baseline reachability (every run)
 
-- **Per-port UDP + TCP sweep** — reachability, packet loss, latency
-  statistics (min / avg / p95 / max / stddev), and MTU sweep at 1200 /
-  1400 / 1472 byte payloads against every port Space Engineers, Torch,
-  and Steam use.
+- **Per-port UDP + TCP sweep** — reachability, packet loss, and latency
+  statistics (min / avg / p95 / max / stddev) against every port Space
+  Engineers, Torch, and Steam use.
+- **Adaptive MTU discovery** — walks UDP payload sizes from 1472 bytes
+  (the standard ethernet ceiling) downward through 1400, 1300, 1280,
+  1200, ... to find the largest size that still round-trips. Carrier
+  sub-tunnels on 5G home internet commonly clamp UDP MTU somewhere in
+  the 1280-1400 range; the descent names the exact ceiling so the
+  recommendation engine can hand the user a copy-paste `netsh` /
+  `ifconfig` / `ip link` command. The ceiling is then spot-checked on
+  every other reachable UDP port to distinguish path-wide MTU clamp
+  from per-port shaping.
+- **Recommendation engine** — interprets the assembled report and
+  emits structured remediation suggestions with platform-specific
+  commands (Windows, macOS, Linux). Stable codes (`mtu-capped`,
+  `mtu-severe`, `dpi-fingerprint`, `per-flow-shaping`,
+  `test-inconclusive`, etc.) make it easy for support staff to grep
+  transcripts. Output renders to the console as a `RECOMMENDATIONS`
+  section and to a top-level `recommendations` array in the JSON
+  report.
+- **Test-inconclusive banner** — when >50% of UDP ports are
+  unreachable, a `TEST INCONCLUSIVE` block prints ABOVE the per-port
+  table so customers don't pattern-match on a sea-of-FAIL without
+  realizing the test server itself is unreachable.
 - **Real Steam A2S_INFO query** on UDP 27015 — full Steam protocol,
   validates that the server is answering as a real Steam endpoint
   would.
@@ -39,7 +59,7 @@ its hardening details are operator-internal.
 
 | Test | What it diagnoses |
 | --- | --- |
-| NAT idle-timeout (30 + 60 s) | CGNAT idle-mapping eviction — the most common T-Mobile 5G Home symptom ("I get disconnected after a few minutes"). Pass `--full` for the longer 30 / 60 / 120 / 300 s ladder. |
+| NAT idle-timeout (30 + 60 s) | CGNAT idle-mapping eviction — the most common 5G home internet symptom ("I get disconnected after a few minutes"). Pass `--full` for the longer 30 / 60 / 120 / 300 s ladder. |
 | NAT type classification | Cone vs symmetric NAT, via reflection probes on UDP 27016 + 27017. Tells you whether peer-to-peer needs a relay. |
 | Bidirectional sustained | Uplink-only throttling, invisible to a downstream-only sustained test. `--bidir up\|down\|both` (default `both`). |
 | Burst-vs-steady | Policer (token bucket — burst loss, steady fine) vs shaper (loss at both rates) vs random loss. |
@@ -108,6 +128,8 @@ situation:
 | Includes | Pre-bundled Node.js 22 LTS runtime, double-click launcher | Source only — bring your own Node 20+ |
 | To run | Double-click `Run-Test.cmd`; report lands in the same folder | `node client/client.js --yes` (defaults to `38.107.232.39`) |
 
+Both are attached to every [GitHub Release](https://github.com/DraconisCluster/SDG-Connection-Utility/releases/latest).
+Customer-facing download portal: <https://sdg.knowledgeondemand.net>
 
 ### Windows easy-install (recommended for end users)
 
@@ -146,16 +168,61 @@ step — the project ships with no dependencies.
 
 ## Reading the output
 
+Three things to look at, in order:
+
+1. **`TEST INCONCLUSIVE` banner** (if printed). When this block appears
+   above the per-port table, more than half of UDP ports failed and the
+   results below are partial. Usually means the test server is
+   unreachable or the connection is severely degraded; rerun in 5
+   minutes before drawing conclusions.
+
+2. **`MTU ceiling discovered on udp 27016: <N> bytes`** line above the
+   per-port table. `1472` means a clean ethernet MTU (cable/fiber).
+   Anything below is a carrier or middlebox clamping UDP — see the
+   `RECOMMENDATIONS` section for the exact fix.
+
+3. **`RECOMMENDATIONS` section** at the bottom of the console output.
+   Always renders. On a clean network it shows a single
+   `[INFO] Network looks healthy` line; on a problem network it lists
+   stable-coded recommendations (`mtu-capped`, `dpi-fingerprint`,
+   `per-flow-shaping`, etc.) with a one-line `Action:` and a
+   copy-paste-ready `Command:` for the host OS when applicable.
+
 Every row in the per-port table should come back green. Loss > 0
 indicates a problem; the client distinguishes ISP loss from server-side
 rate-limiting in the `RL` column so the limiter never causes a false
-positive against the ISP under test.
+positive against the ISP under test. The `mtu` column shows
+pass/fail at the discovered ceiling (not the largest of a fixed sweep,
+as in pre-v1.3 reports).
 
 The server-dependent tests (`nat-type` and `bidir up`/`both`)
 gracefully degrade against a v1.0.0 server: the client probes for
 support and prints `SKIPPED (server too old)` if not present.
 Reflected public IP is redacted by default in both the console output
 and the `--json` report — pass `--include-public-ip` to opt in.
+
+### JSON report shape (`--json <file>`)
+
+The full report schema is `report.version: 2`. Notable top-level
+fields:
+
+- `mtuDiscovery: { ok, discoveredOn, descent, ceiling, ceilingConfidence }`
+  — the full descent history (which sizes were probed and how many
+  probes passed at each), the discovered ceiling in bytes, and a
+  `'high' | 'medium' | 'none'` confidence label.
+- `recommendations: [{ severity, code, title, detail, action }]` —
+  one entry per fired rule. `action.platformCommands.{windows, macos,
+  linux}` carries copy-paste commands; the console renders only the
+  host-OS line, but JSON retains all three for cross-platform support
+  workflows.
+- `perPort[].mtuAtCeiling: { size, ok, rtt, probes }` — the
+  spot-check result at the discovered ceiling on this UDP port.
+- `perPort[].portSpecificShaping: true` — set only when the
+  spot-check fails at the discovered ceiling for a specific port,
+  signaling that this one port is shaped differently from the rest.
+- `deprecated: ['perPort[].mtuSweep']` — `mtuSweep` is still
+  populated as a one-element alias of `mtuAtCeiling` for backwards
+  compatibility with pre-v2 `jq` queries; it will be removed in v1.4.
 
 ## Common flags
 
@@ -164,7 +231,7 @@ and the `--json` report — pass `--include-public-ip` to opt in.
 | `--host <addr>` | `38.107.232.39` | Override the SDG public endpoint. |
 | `--json <file>` | (none) | Write a full JSON report to `<file>`. |
 | `--yes`, `-y` | prompt | Skip the "what this will do" confirmation. |
-| `--family <4\|6\|auto>` | `auto` | Force IPv4, IPv6, or let the OS pick. Use `4` on a v6-native network (e.g. T-Mobile 5G Home Internet w/ 464XLAT) if you suspect Happy-Eyeballs is masking the problem. |
+| `--family <4\|6\|auto>` | `auto` | Force IPv4, IPv6, or let the OS pick. Use `4` on a v6-native network (e.g. 5G home internet with 464XLAT) if you suspect Happy-Eyeballs is masking the problem. |
 | `--ports <p1,p2,...>` | full matrix | Limit the per-port sweep to specific ports. |
 | `--real-server <host:port>` | (none) | A2S-query the customer's actual Torch server for side-by-side comparison. |
 | `--bidir <down\|up\|both>` | `both` | Sustained-test direction. |
@@ -173,7 +240,7 @@ and the `--json` report — pass `--include-public-ip` to opt in.
 | `--nat-idle <s1,s2,...>` | `30,60` | Custom NAT-idle windows (max 600 s each). |
 | `--full` | off | Run the full NAT-idle ladder: 30 / 60 / 120 / 300 s (~10 min total). |
 | `--include-public-ip` | off | Don't redact the reflected source IP. |
-| `--no-sustained`, `--no-a2s`, `--no-nat-idle`, `--no-nat-type`, `--no-burst`, `--no-source-fanout`, `--no-payload-shape` | all on | Dial back individual tests. |
+| `--no-sustained`, `--no-a2s`, `--no-nat-idle`, `--no-nat-type`, `--no-burst`, `--no-source-fanout`, `--no-payload-shape`, `--no-mtu-discovery` | all on | Dial back individual tests. |
 
 `node client.js --help` prints the full option list with longer
 explanations.
@@ -199,8 +266,8 @@ runtime so end users don't need to install anything.
 ## Origin
 
 This tool exists because of a real customer case: Space Engineers
-worked fine over a Verizon cellular hotspot and failed over T-Mobile
-5G Home Internet, from the same laptop, against the same Torch server.
+worked fine over a cellular hotspot and failed over 5G home internet,
+from the same laptop, against the same Torch server.
 We needed hard evidence rather than another round of "try a different
 DNS server" — and the diagnostic surface documented above is what hard
 evidence looks like. CGNAT idle eviction, symmetric NAT, uplink-only

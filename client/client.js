@@ -61,12 +61,37 @@ const { dgramTypeFor, normalizeIp } = require('../shared/netUtils');
 const PROBE_TIMEOUT_MS   = 2000;
 const LOSS_PACKET_COUNT  = 50;
 const LOSS_INTERVAL_MS   = 100;      // 10 pps
-// MTU sweep — three payload sizes that bracket the typical sub-tunnel MTU.
-// 1200 should succeed everywhere. 1400 is the customary "safe" UDP MTU
-// after carrier overhead. 1472 = 1500 - 20B IPv4 - 8B UDP, the max that
-// fits in a 1500-byte ethernet frame. T-Mobile is documented to silently
-// drop UDP above ~1400; the sweep makes that stair-step visible.
-const MTU_SWEEP_BYTES    = Object.freeze([1200, 1400, 1472]);
+// MTU descent — payload sizes for adaptive MTU discovery. Sized from
+// the max that fits in a 1500-byte ethernet frame (1472 = 1500 - 20B
+// IPv4 - 8B UDP) down to the IPv4 minimum (576). 5G home internet
+// providers commonly clamp UDP somewhere in the 1280-1400 range due
+// to mobile sub-tunnel encapsulation overhead, which is invisible to
+// the OS — packets just disappear above the ceiling. Walking down
+// finds the actual working size rather than just confirming "1400 is
+// dropped." Discovery stops at the first size that round-trips.
+const MTU_DESCENT_BYTES    = Object.freeze([1472, 1400, 1300, 1280, 1200, 1100, 1000, 900, 800, 576]);
+// IPv6 starts 20 bytes lower (40-byte v6 header vs. 20-byte v4).
+const MTU_DESCENT_BYTES_V6 = Object.freeze([1452, 1400, 1300, 1280, 1200, 1100, 1000, 900, 800, 576]);
+// Per-size probe count and the threshold for "size passed".
+const MTU_PROBES_PER_SIZE  = 3;
+const MTU_PASS_THRESHOLD   = 2;          // >=2/3 succeed => passed
+// Borderline (exactly 2/3): retry with 3 more probes, require 4/6.
+const MTU_TIEBREAKER_TOTAL = 6;
+const MTU_TIEBREAKER_PASS  = 4;
+// Per-probe spacing within a size class. Matches udpLossTest cadence
+// so loss measurements are apples-to-apples.
+const MTU_PROBE_SPACING_MS = 100;
+// Stability check at 1472 — only fires when there's a suspicious
+// signal (an RTT spike at 1472 vs. baseline). If <90% of these
+// verification probes pass, downgrade ceiling to 1400 and emit a
+// "mtu-marginal" recommendation.
+const MTU_STABILITY_PROBES = 5;
+const MTU_STABILITY_PASS_PCT = 0.9;
+// Rate-limit backoff before retry (one retry, then give up).
+const MTU_RATE_LIMIT_BACKOFF_MS = 500;
+// Fallback discovery target ports tried in order if the primary
+// (UDP 27016) fails the 576B probe.
+const MTU_FALLBACK_PORTS   = Object.freeze([8766, 27015, 27443]);
 const SUSTAINED_MS       = 10_000;   // game-shape test duration
 const SUSTAINED_PPS      = 60;       // expected server rate; used only for
                                      // reporting, not for sending.
@@ -97,7 +122,7 @@ const FANOUT_PACKETS_EACH  = 20;
 // (UDP 27016) because that's the most likely target of game-aware DPI.
 const PAYLOAD_SHAPE_PACKETS_EACH = 25;
 // NAT idle-timeout test default windows. CGNAT idle is the single most
-// common cause of mid-session SE disconnects on T-Mobile 5G Home; the
+// common cause of mid-session SE disconnects on 5G home internet; the
 // 30/60/120/300 ladder brackets the documented carrier values.
 const NAT_IDLE_WINDOWS_DEFAULT = Object.freeze([30, 60, 120, 300]);
 // Reflection-padded probe size. The protocol requires a probe of >=60
@@ -160,6 +185,12 @@ function parseArgs(argv) {
     // shaping, DPI by payload signature, loss-burst patterns).
     sourcePortFanout: true,
     payloadShape: true,
+    // Adaptive MTU discovery — ON by default. Replaces the legacy
+    // per-port 3-size sweep. Costs ~5s on a typical capped-MTU path,
+    // ~1s on a clean cable/fiber path. Pass --no-mtu-discovery to
+    // skip (e.g. when running with --ports filter that excludes all
+    // critical UDP ports).
+    mtuDiscovery: true,
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -238,6 +269,7 @@ function parseArgs(argv) {
     else if (a === '--include-public-ip') out.includePublicIp = true;
     else if (a === '--no-source-fanout') out.sourcePortFanout = false;
     else if (a === '--no-payload-shape') out.payloadShape = false;
+    else if (a === '--no-mtu-discovery') out.mtuDiscovery = false;
     else if (a === '--help' || a === '-h') out.help = true;
     else { console.error(`Unknown argument: ${a}`); out.help = true; }
   }
@@ -266,7 +298,7 @@ Options:
   --duration <seconds>     Override the sustained test duration (default 10).
   --family <4|6|auto>      Force IPv4 ('4'), IPv6 ('6'), or let the OS pick
                            ('auto', the default). Use '4' on a v6-native
-                           network (e.g. T-Mobile 5G Home Internet w/ 464XLAT)
+                           network (e.g. 5G home internet with 464XLAT)
                            if you suspect Happy-Eyeballs is masking the
                            problem. The SDG test server is currently v4-only;
                            '6' will only succeed against AAAA-publishing
@@ -307,6 +339,11 @@ Phase 2 diagnostics (ON by default — adds ~30 s):
                            sends probes with three different payload
                            contents (game-shape, random, zero-fill) to
                            detect DPI by content fingerprint.
+  --no-mtu-discovery       Skip adaptive MTU discovery. By default the
+                           tool walks UDP probe sizes down from 1472 to
+                           find the actual MTU ceiling on the path and
+                           prints a remediation command if the ceiling
+                           is below the standard 1500-byte ethernet MTU.
 
 Loss-burst histogram and reordering counts are added to every UDP
 loss test and sustained run automatically — no flag needed; they're
@@ -416,10 +453,10 @@ function classifyNatType(reflectionA, reflectionB) {
   if (reflectionA.family === 6 || reflectionB.family === 6) {
     return { kind: 'no-nat', reason: 'IPv6 path — no NAT typically applied' };
   }
-  // Carriers (T-Mobile 5G Home, notably) rotate CGNAT egress IPs across
-  // a /20 every few minutes. Two probes 2 s apart can legitimately come
-  // back with different reflected IPs even on the same socket — that's
-  // not what defines symmetric NAT. Only the port comparison matters.
+  // 5G home internet carriers rotate CGNAT egress IPs across a /20
+  // every few minutes. Two probes 2 s apart can legitimately come back
+  // with different reflected IPs even on the same socket — that's not
+  // what defines symmetric NAT. Only the port comparison matters.
   if (reflectionA.port === reflectionB.port) {
     return { kind: 'cone', reason: 'reflected source port stable across two destinations' };
   }
@@ -607,6 +644,364 @@ function classifyPayloadShape(perPatternLoss) {
   return { kind: 'mild-variance', reason: `loss spread ${spread.toFixed(1)}% across payload shapes — borderline` };
 }
 
+// ---- MTU descent decision helper (pure) ----
+//
+// Given the descent history so far and the descending size ladder,
+// decide the next step. The imperative discovery loop calls this to
+// figure out what to do; all the messy network I/O stays in the loop,
+// all the state-machine logic lives here (and is fully unit-testable
+// without sockets — matches the classifyNatType / classifyFanout
+// pattern above).
+//
+// history is an array of size-blocks, oldest first:
+//   { size: <bytes>, probes: [{ ok, rtt|null }, ...] }
+//
+// descent is the ladder of sizes in descending order, e.g. MTU_DESCENT_BYTES.
+//
+// Returns one of:
+//   { action: 'probe',  size: <bytes> }                                next probe to send
+//   { action: 'done',   ceiling: <bytes>|null, ceilingConfidence: 'high'|'medium'|'none' }
+//
+// Algorithm:
+//   1. No history yet → probe the largest size.
+//   2. Current size has fewer than MTU_PROBES_PER_SIZE probes → keep probing it.
+//   3. Current size has 2+/3 passes (or 4+/6 in tiebreaker) → done, this is the ceiling.
+//   4. Current size has exactly 2/3 fail (1 pass) → indistinguishable from threshold; advance.
+//      (Pure borderline is 2 passes — that is "passed" via threshold above.)
+//   5. Current size has 0–1 pass with 3 probes done AND we've also failed the previous
+//      size from the top (or are at history index >= 2 with all-failed) → fast-fail:
+//      jump to the smallest size in the descent.
+//   6. Otherwise → advance to the next smaller size.
+//   7. If we failed at the smallest size → done with ceiling=null.
+function decideNextMtuStep(history, descent, opts = {}) {
+  const minProbes      = opts.minProbes      ?? MTU_PROBES_PER_SIZE;
+  const passThreshold  = opts.passThreshold  ?? MTU_PASS_THRESHOLD;
+  const tiebreakerTotal = opts.tiebreakerTotal ?? MTU_TIEBREAKER_TOTAL;
+  const tiebreakerPass  = opts.tiebreakerPass  ?? MTU_TIEBREAKER_PASS;
+
+  if (!Array.isArray(descent) || descent.length === 0) {
+    return { action: 'done', ceiling: null, ceilingConfidence: 'none' };
+  }
+  if (!Array.isArray(history)) {
+    // Invalid input — fail safe rather than start a descent we may never end.
+    return { action: 'done', ceiling: null, ceilingConfidence: 'none' };
+  }
+  if (history.length === 0) {
+    return { action: 'probe', size: descent[0] };
+  }
+
+  const last = history[history.length - 1];
+  if (!last || !Array.isArray(last.probes)) {
+    return { action: 'done', ceiling: null, ceilingConfidence: 'none' };
+  }
+
+  const passes = last.probes.filter((p) => p && p.ok).length;
+  const total  = last.probes.length;
+
+  // Still in the initial round at this size.
+  if (total < minProbes) {
+    return { action: 'probe', size: last.size };
+  }
+
+  // Initial round complete (minProbes probes done).
+  if (total === minProbes) {
+    // All passed — high confidence, no tiebreaker needed.
+    if (passes === minProbes) {
+      return { action: 'done', ceiling: last.size, ceilingConfidence: 'high' };
+    }
+    // Borderline pass: at or above threshold but not unanimous — trigger
+    // the tiebreaker by probing more at the same size.
+    if (passes >= passThreshold) {
+      return { action: 'probe', size: last.size };
+    }
+    // Below threshold — fall through to fail/advance logic below.
+  }
+
+  // Tiebreaker in progress.
+  if (total > minProbes && total < tiebreakerTotal) {
+    return { action: 'probe', size: last.size };
+  }
+
+  // Tiebreaker complete.
+  if (total >= tiebreakerTotal) {
+    if (passes >= tiebreakerPass) {
+      return { action: 'done', ceiling: last.size, ceilingConfidence: 'medium' };
+    }
+    // Tiebreaker failed — fall through to size-advance logic below.
+  }
+
+  // Last size failed. Decide whether to fast-fail to the minimum size
+  // or just advance to the next smaller size.
+  const minSize = descent[descent.length - 1];
+
+  // If we just failed at the minimum size, the descent is exhausted.
+  if (last.size === minSize) {
+    return { action: 'done', ceiling: null, ceilingConfidence: 'none' };
+  }
+
+  // Fast-fail: we've now attempted at least 2 sizes and none have passed.
+  // Jump directly to the minimum size, unless we've already tried it.
+  const triedMin = history.some((h) => h.size === minSize);
+  if (history.length >= 2 && !triedMin) {
+    const allFailed = history.every((h) => {
+      const ps = h.probes.filter((p) => p && p.ok).length;
+      return ps < passThreshold;
+    });
+    if (allFailed) {
+      return { action: 'probe', size: minSize };
+    }
+  }
+
+  // Advance to the next smaller size in the descent.
+  const idx = descent.indexOf(last.size);
+  if (idx < 0 || idx + 1 >= descent.length) {
+    return { action: 'done', ceiling: null, ceilingConfidence: 'none' };
+  }
+  return { action: 'probe', size: descent[idx + 1] };
+}
+
+// ---- Recommendation engine (pure) ----
+//
+// A recommendation is a structured interpretation of one or more
+// signals in the assembled report. Each rule is a pure function
+// (report) -> Recommendation | null. The engine runs them in order
+// (priority order — test-inconclusive first so it's the lead item
+// when many things are also broken) and returns the array of fired
+// ones. The "network-healthy" catch-all is appended if nothing else
+// fired, so users always see a section header.
+//
+// Recommendation shape:
+//   {
+//     severity: 'critical' | 'warning' | 'info',
+//     code: string,                              // stable id for grep/support
+//     title: string,                             // short human header
+//     detail: string,                            // 1-2 sentence explanation
+//     action: null | {
+//       summary: string,                         // imperative one-liner
+//       platformCommands: {                      // per-OS copy-paste-ready
+//         windows: string|null,
+//         macos:   string|null,
+//         linux:   string|null,
+//       }
+//     }
+//   }
+//
+// Skipped Phase 1/2 data is treated as ABSENT (not as PASSED) — rules
+// guard their inputs with the existing `.skipped: true` convention.
+
+// Build the recommended adapter MTU for a discovered ceiling. For the
+// warning band (1280..1471), give a 20-byte safety margin so PPPoE or
+// similar tunnels added later don't push the network back over the
+// edge. For the severe band (<1280), recommend the ceiling itself —
+// we're already near the IPv4 minimum (576) and any margin loses real
+// usable payload.
+function recommendedMtuFor(ceiling) {
+  if (ceiling == null) return null;
+  if (ceiling >= 1472) return null;
+  if (ceiling < 1280) return ceiling;
+  return Math.max(1280, ceiling - 20);
+}
+
+function mtuPlatformCommands(mtu) {
+  return {
+    windows: `netsh interface ipv4 set subinterface "Wi-Fi" mtu=${mtu} store=persistent`,
+    macos:   `sudo ifconfig en0 mtu ${mtu}`,
+    linux:   `sudo ip link set dev <iface> mtu ${mtu}`,
+  };
+}
+
+// Count how many UDP rows were attempted and how many came back
+// unreachable. Used by ruleTestInconclusive.
+function udpReachabilityStats(report) {
+  if (!Array.isArray(report.perPort)) return { attempted: 0, unreachable: 0 };
+  let attempted = 0;
+  let unreachable = 0;
+  for (const r of report.perPort) {
+    if (r.proto !== 'udp') continue;
+    attempted++;
+    if (!r.reachable) unreachable++;
+  }
+  return { attempted, unreachable };
+}
+
+// ---- Individual rules ----
+
+function ruleTestInconclusive(report) {
+  const { attempted, unreachable } = udpReachabilityStats(report);
+  if (attempted < 3) return null; // not enough data to make this call
+  const failPct = unreachable / attempted;
+  if (failPct <= 0.5) return null;
+  const capDown = report.capabilities && report.capabilities.ok === false;
+  const detail = capDown
+    ? `${unreachable} of ${attempted} UDP ports were unreachable AND the capability probe also timed out. The SDG test server is probably unreachable from this network, OR your Internet connection is severely degraded.`
+    : `${unreachable} of ${attempted} UDP ports were unreachable. The SDG test server may be temporarily down, OR your Internet connection is severely degraded.`;
+  return {
+    severity: 'critical',
+    code: 'test-inconclusive',
+    title: 'Test results are partial — interpret with caution',
+    detail,
+    action: {
+      summary: 'Wait 5 minutes and run the test again. If the same pattern repeats, check whether outbound UDP is blocked by a firewall.',
+      platformCommands: null,
+    },
+  };
+}
+
+function ruleMtuSevere(report) {
+  const d = report.mtuDiscovery;
+  if (!d || !d.ok || d.ceiling == null) return null;
+  if (d.ceiling >= 1280) return null;
+  const mtu = recommendedMtuFor(d.ceiling);
+  return {
+    severity: 'critical',
+    code: 'mtu-severe',
+    title: `Network MTU is severely restricted (~${d.ceiling} bytes)`,
+    detail: `Anything above ${d.ceiling} bytes is being silently dropped on this path. This is unusual — typically only seen on broken tunnels or aggressive carrier shaping. Game traffic will stutter even after the MTU fix.`,
+    action: {
+      summary: `Lower your network adapter MTU to ${mtu} and consider a wired connection or alternate ISP.`,
+      platformCommands: mtuPlatformCommands(mtu),
+    },
+  };
+}
+
+function ruleMtuCapped(report) {
+  const d = report.mtuDiscovery;
+  if (!d || !d.ok || d.ceiling == null) return null;
+  if (d.ceiling >= 1472 || d.ceiling < 1280) return null;
+  const mtu = recommendedMtuFor(d.ceiling);
+  return {
+    severity: 'warning',
+    code: 'mtu-capped',
+    title: `Network MTU is capped at ~${d.ceiling} bytes`,
+    detail: `Packets larger than ${d.ceiling} bytes are being silently dropped on this path. This pattern is common on 5G home internet across major US providers — the carrier's mobile sub-tunnel adds encapsulation overhead that eats the last 100-200 bytes of the standard 1500-byte ethernet MTU. Without an OS-level MTU change, large UDP packets will appear as silent packet loss in-game.`,
+    action: {
+      summary: `Lower your network adapter MTU to ${mtu}. The Windows command below is ready to copy-paste; replace "Wi-Fi" with your adapter name if needed (list them with: netsh interface show interface).`,
+      platformCommands: mtuPlatformCommands(mtu),
+    },
+  };
+}
+
+function ruleMtuMarginal(report) {
+  const d = report.mtuDiscovery;
+  if (!d || !d.ok) return null;
+  if (d.ceilingConfidence !== 'medium') return null;
+  return {
+    severity: 'warning',
+    code: 'mtu-marginal',
+    title: 'MTU result is borderline',
+    detail: `The discovered ceiling (${d.ceiling} bytes) required a tiebreaker round — about a third of probes at that size still failed. Expect occasional packet loss at the ceiling itself; the recommendation already accounts for this with a safety margin.`,
+    action: null,
+  };
+}
+
+function ruleCgnat464xlat(report) {
+  if (report.family !== 4) return null;
+  const d = report.mtuDiscovery;
+  if (!d || !d.ok || d.ceiling == null) return null;
+  if (d.ceiling > 1280) return null;
+  return {
+    severity: 'info',
+    code: 'cgnat-464xlat',
+    title: 'Your network is likely behind 464XLAT (IPv4-over-IPv6 carrier translation)',
+    detail: 'The combination of IPv4 transport with an MTU at or below 1280 bytes is the classic 464XLAT signature used by 5G home internet providers. Behavior is normal but your effective IPv4 MTU is permanently smaller than it would be on a non-cellular ISP.',
+    action: null,
+  };
+}
+
+function ruleDpiFingerprint(report) {
+  const p = report.payloadShape;
+  if (!p || p.skipped) return null;
+  if (!p.verdict || p.verdict.kind !== 'dpi-fingerprint') return null;
+  return {
+    severity: 'warning',
+    code: 'dpi-fingerprint',
+    title: 'Deep packet inspection (DPI) detected',
+    detail: `Your network drops UDP differently based on payload content: ${p.verdict.reason}. This typically means a carrier or middlebox is making content-based decisions about your traffic, which can silently break game protocols during congestion.`,
+    action: {
+      summary: 'A VPN (encrypting all traffic) bypasses content-based DPI. Try one if game traffic remains unreliable after the MTU fix.',
+      platformCommands: null,
+    },
+  };
+}
+
+function rulePerFlowShaping(report) {
+  const f = report.sourcePortFanout;
+  if (!f || f.skipped) return null;
+  if (!f.verdict || f.verdict.kind !== 'per-flow') return null;
+  return {
+    severity: 'warning',
+    code: 'per-flow-shaping',
+    title: 'Per-connection traffic shaping detected',
+    detail: `Loss varies dramatically across your source ports: ${f.verdict.reason}. The carrier or router is making per-5-tuple decisions, which means some game connections will be silently degraded while others on the same network work fine.`,
+    action: {
+      summary: 'Restarting the game/PC sometimes lands on a better-treated source port. Persistent issues usually require contacting the ISP.',
+      platformCommands: null,
+    },
+  };
+}
+
+function ruleNatIdleShort(report) {
+  const n = report.natIdle;
+  if (!n || n.skipped) return null;
+  if (typeof n.largestSurvivedSec !== 'number') return null;
+  if (n.largestSurvivedSec >= 60) return null;
+  return {
+    severity: 'warning',
+    code: 'nat-idle-short',
+    title: `NAT mapping evicted after only ${n.largestSurvivedSec}s of idle`,
+    detail: 'Your carrier or router drops the NAT mapping for the game connection in under a minute of no traffic. Pausing in-game (menus, AFK, loading screens) can trigger a mid-session disconnect.',
+    action: {
+      summary: 'Enable in-game keepalive options if available; otherwise this is mostly a carrier-side limitation.',
+      platformCommands: null,
+    },
+  };
+}
+
+function ruleSymmetricNat(report) {
+  const t = report.natType;
+  if (!t || t.skipped) return null;
+  if (!t.verdict || t.verdict.kind !== 'symmetric') return null;
+  return {
+    severity: 'info',
+    code: 'symmetric-nat',
+    title: 'Symmetric NAT detected',
+    detail: 'Direct peer-to-peer connections to other symmetric-NAT users will fail. For Space Engineers this only matters if you host or connect to peer-to-peer games; dedicated-server connections are unaffected.',
+    action: null,
+  };
+}
+
+function ruleNetworkHealthy(_report) {
+  return {
+    severity: 'info',
+    code: 'network-healthy',
+    title: 'Network looks healthy',
+    detail: 'No actionable issues detected. If you are still having connection problems, they are likely server-side or game-specific.',
+    action: null,
+  };
+}
+
+const RULES = Object.freeze([
+  ruleTestInconclusive,
+  ruleMtuSevere,
+  ruleMtuCapped,
+  ruleMtuMarginal,
+  ruleCgnat464xlat,
+  ruleDpiFingerprint,
+  rulePerFlowShaping,
+  ruleNatIdleShort,
+  ruleSymmetricNat,
+]);
+
+function buildRecommendations(report) {
+  const out = [];
+  for (const rule of RULES) {
+    const r = rule(report);
+    if (r) out.push(r);
+  }
+  if (out.length === 0) out.push(ruleNetworkHealthy(report));
+  return out;
+}
+
 // Redact a public IP for inclusion in any output channel that may be
 // shared. The README invites users to share their JSON report — and
 // support flows commonly involve pasting the console transcript into
@@ -758,6 +1153,185 @@ async function udpLossTest({ host, port, nonce, family = 4 }) {
     burstHistogram: lossBurstHistogram(arrivedSeqs, LOSS_PACKET_COUNT),
     reordering: countReorderings(arrivalOrder),
   };
+}
+
+// ================================================================
+// MTU discovery — adaptive linear descent + fallback + spot-check
+// ================================================================
+//
+// MTU is a path property, not a per-port property. Discovery runs once
+// against the critical SE game port (UDP 27016) using a linear descent
+// from 1472 down to 576, then every other reachable UDP port is
+// spot-checked at the discovered ceiling. This both (a) names the
+// actual working size when the path clamps MTU (5G home internet, most
+// commonly) and (b) tells us whether the clamp is universal or
+// per-port.
+//
+// Imperative loop here, pure state-machine logic in decideNextMtuStep
+// above. That separation lets us unit-test the algorithm without sockets.
+
+// Run the descent against one port. Returns either:
+//   { ok: true,  discoveredOn, descent, ceiling: <bytes>|null, ceilingConfidence }
+//   { ok: false, skipped: true,  reason: 'rate-limited', descent }
+//   { ok: false, skipped: false, error: '...', partialHistory }
+//
+// `probeFn` defaults to `udpProbe`. Tests inject a deterministic stand-in.
+async function discoverMtuCeiling({
+  host, port, nonce, family = 4,
+  probeFn = udpProbe,
+  descent = null,
+  sequenceBase = 9000,
+}) {
+  const ladder = descent || (family === 6 ? MTU_DESCENT_BYTES_V6 : MTU_DESCENT_BYTES);
+  const history = [];
+  let sequence = sequenceBase;
+  // Safety bound. With a 10-rung ladder, tiebreaker (+3 probes), and one
+  // rate-limit retry, the max possible iterations is well under 100.
+  for (let safety = 0; safety < 100; safety++) {
+    const step = decideNextMtuStep(history, ladder);
+    if (step.action === 'done') {
+      return {
+        ok: true,
+        discoveredOn: port,
+        descent: history,
+        ceiling: step.ceiling,
+        ceilingConfidence: step.ceilingConfidence,
+      };
+    }
+    const size = step.size;
+    let entry = history.find((h) => h.size === size);
+    if (!entry) {
+      entry = { size, probes: [] };
+      history.push(entry);
+    }
+    let result;
+    try {
+      result = await probeFn({
+        host, port, nonce, sequence: sequence++,
+        family, payloadSize: size,
+      });
+    } catch (e) {
+      return { ok: false, skipped: false, error: e.message || String(e), partialHistory: history };
+    }
+    if (result && result.rateLimited) {
+      // Backoff and retry once. If still rate-limited, the path is fine
+      // but the SDG server's own limiter is eating our probes; treat the
+      // run as inconclusive rather than mis-recommending a lower MTU.
+      await new Promise((r) => setTimeout(r, MTU_RATE_LIMIT_BACKOFF_MS));
+      let retry;
+      try {
+        retry = await probeFn({
+          host, port, nonce, sequence: sequence++,
+          family, payloadSize: size,
+        });
+      } catch (e) {
+        return { ok: false, skipped: false, error: e.message || String(e), partialHistory: history };
+      }
+      if (retry && retry.rateLimited) {
+        return { ok: false, skipped: true, reason: 'rate-limited', descent: history };
+      }
+      entry.probes.push({ ok: !!(retry && retry.ok), rtt: retry ? retry.rtt : null });
+    } else {
+      entry.probes.push({ ok: !!(result && result.ok), rtt: result ? result.rtt : null });
+    }
+    // Spacing between probes; matches udpLossTest cadence so loss
+    // measurements stay comparable.
+    await new Promise((r) => setTimeout(r, MTU_PROBE_SPACING_MS));
+  }
+  return { ok: false, skipped: false, error: 'descent loop exceeded safety limit', partialHistory: history };
+}
+
+// Try the primary port first; if the descent exhausts without finding
+// a working size, try fallback ports in order. Each fallback gets a
+// single 576B probe before committing to a full descent — that's the
+// fast-fail for completely broken paths (TEST-NET-1, ISP down, etc.).
+async function runMtuDiscoveryWithFallback({
+  host, primaryPort, fallbackPorts, nonce, family = 4,
+  probeFn = udpProbe,
+}) {
+  const primary = await discoverMtuCeiling({ host, port: primaryPort, nonce, family, probeFn });
+  if (primary.ok && primary.ceiling != null) return primary;
+  // Rate-limited result is final — don't try fallbacks, the path itself is fine.
+  if (primary.skipped) return primary;
+  // Network error during primary descent is fatal too.
+  if (!primary.ok) return primary;
+  // Primary returned ceiling=null. Try the fallback chain.
+  let probeSeq = 8999;
+  for (let i = 0; i < fallbackPorts.length; i++) {
+    const fbPort = fallbackPorts[i];
+    let preflight;
+    try {
+      preflight = await probeFn({
+        host, port: fbPort, nonce, sequence: probeSeq--,
+        family, payloadSize: 576,
+      });
+    } catch (e) {
+      continue;
+    }
+    if (!preflight || !preflight.ok) continue;
+    const fb = await discoverMtuCeiling({
+      host, port: fbPort, nonce, family, probeFn,
+      sequenceBase: 9100 + i * 50,
+    });
+    if (fb.ok && fb.ceiling != null) {
+      return { ...fb, fellBackFrom: primaryPort };
+    }
+  }
+  return {
+    ok: true,
+    discoveredOn: primaryPort,
+    descent: primary.descent || [],
+    ceiling: null,
+    ceilingConfidence: 'none',
+    reason: 'no-reachable-discovery-port',
+  };
+}
+
+// Spot-check the discovered ceiling on every reachable UDP port in
+// parallel. Different destination ports = different 5-tuples = no reply
+// confusion possible. One probe per port; on failure, a second probe
+// before flagging it — transient loss happens.
+async function spotCheckCeiling({
+  host, ports, nonce, family = 4, ceiling,
+  probeFn = udpProbe,
+}) {
+  if (ceiling == null) return [];
+  return Promise.all(ports.map(async (port, idx) => {
+    let p1;
+    try {
+      p1 = await probeFn({
+        host, port, nonce, sequence: 9500 + idx * 2,
+        family, payloadSize: ceiling,
+      });
+    } catch (e) {
+      p1 = { ok: false, rtt: null, rateLimited: false };
+    }
+    if (p1 && p1.ok) {
+      return {
+        port, size: ceiling, ok: true, rtt: p1.rtt,
+        probes: [{ ok: true, rtt: p1.rtt }],
+      };
+    }
+    let p2;
+    try {
+      p2 = await probeFn({
+        host, port, nonce, sequence: 9500 + idx * 2 + 1,
+        family, payloadSize: ceiling,
+      });
+    } catch (e) {
+      p2 = { ok: false, rtt: null, rateLimited: false };
+    }
+    return {
+      port,
+      size: ceiling,
+      ok: !!(p2 && p2.ok),
+      rtt: p2 ? p2.rtt : null,
+      probes: [
+        { ok: !!(p1 && p1.ok), rtt: p1 ? p1.rtt : null },
+        { ok: !!(p2 && p2.ok), rtt: p2 ? p2.rtt : null },
+      ],
+    };
+  }));
 }
 
 // ================================================================
@@ -1760,12 +2334,13 @@ async function runTests(opts) {
   const portsToTest = filterPorts(PORTS, opts.ports);
 
   const report = {
-    version: 1,
-    tool: 'sdg-connection-utility client',
+    version: 2,
+    tool: 'sdg-connection-test client',
     startedAt: new Date().toISOString(),
     host, resolved, family,
     nonceHex: toHex(nonce),
     capabilities: null,
+    mtuDiscovery: null,
     perPort: [],
     a2s: null,
     sustained: null,
@@ -1775,6 +2350,11 @@ async function runTests(opts) {
     burstVsSteady: null,
     sourcePortFanout: null,
     payloadShape: null,
+    recommendations: null,
+    // Field names that are still populated but will be removed in a
+    // future release. Support staff can grep on this to detect the
+    // transition.
+    deprecated: ['perPort[].mtuSweep'],
   };
 
   // Capability probe runs first whenever a Phase 1 server-dependent
@@ -1800,6 +2380,56 @@ async function runTests(opts) {
     }
   }
 
+  // MTU discovery — runs once against the critical SE game port (or a
+  // fallback if 27016 is itself unreachable). MTU is a path property,
+  // not per-port — discovering it once and spot-checking the other
+  // UDP ports is both faster and produces a clearer single
+  // recommendation than the old per-port 3-size sweep ever did.
+  if (opts.mtuDiscovery !== false) {
+    const primary = GAME_SHAPE_PORT;
+    const fallbackChain = MTU_FALLBACK_PORTS.filter((p) => p !== primary);
+    // If the user filtered ports, only run discovery against ports they kept.
+    // opts.ports is parsed as strings by argv; coerce for comparison.
+    const portsAsNumbers = opts.ports ? new Set(opts.ports.map((n) => Number(n))) : null;
+    const filteredPorts = portsAsNumbers
+      ? [primary, ...fallbackChain].filter((p) => portsAsNumbers.has(p))
+      : [primary, ...fallbackChain];
+    if (filteredPorts.length === 0) {
+      report.mtuDiscovery = {
+        skipped: true,
+        reason: 'no-discovery-port-in-filter',
+      };
+      console.log('  MTU discovery: skipped (no critical UDP port in --ports filter)');
+    } else {
+      const discoveryPrimary = filteredPorts[0];
+      const discoveryFallbacks = filteredPorts.slice(1);
+      process.stdout.write(`  MTU discovery on udp ${discoveryPrimary} ... `);
+      try {
+        const result = await runMtuDiscoveryWithFallback({
+          host: resolved,
+          primaryPort: discoveryPrimary,
+          fallbackPorts: discoveryFallbacks,
+          nonce, family,
+        });
+        report.mtuDiscovery = result;
+        if (result.ok && result.ceiling != null) {
+          console.log(`ceiling=${result.ceiling} on udp ${result.discoveredOn} (${result.ceilingConfidence})`);
+        } else if (result.skipped) {
+          console.log(`skipped (${result.reason})`);
+        } else if (result.ok && result.ceiling == null) {
+          console.log('no working size found');
+        } else {
+          console.log(`FAIL (${result.error || 'unknown'})`);
+        }
+      } catch (e) {
+        report.mtuDiscovery = { ok: false, skipped: false, error: e.message || String(e) };
+        console.log(`FAIL (${e.message || e})`);
+      }
+    }
+  } else {
+    report.mtuDiscovery = { skipped: true, reason: 'disabled-by-flag' };
+  }
+
   const rows = [];
 
   for (const p of portsToTest) {
@@ -1823,20 +2453,10 @@ async function runTests(opts) {
         if (row.reachable) {
           row.loss = await udpLossTest({ host: resolved, port: p.port, nonce, family });
           if (row.loss.rateLimited > 0) row.rateLimited = true;
-          row.mtuSweep = [];
-          for (let i = 0; i < MTU_SWEEP_BYTES.length; i++) {
-            const size = MTU_SWEEP_BYTES[i];
-            const res = await udpProbe({
-              host: resolved, port: p.port, nonce, sequence: 9000 + i,
-              family, payloadSize: size,
-            });
-            row.mtuSweep.push({ size, ok: res.ok, rtt: res.rtt });
-          }
-          // Backwards-compatible single field: the largest size that worked,
-          // or the smallest probe's result if none worked. Consumers that
-          // only knew about `mtu` (an object with size/ok/rtt) keep working.
-          const lastOk = [...row.mtuSweep].reverse().find(s => s.ok) || row.mtuSweep[0];
-          row.mtu = lastOk;
+          // MTU is now discovered once (above) and spot-checked across
+          // all reachable UDP ports (below, after this loop) — the old
+          // per-port 3-size sweep is gone. `row.mtu` / `row.mtuSweep`
+          // are filled in by the spot-check pass.
         }
       } else {
         const r = await tcpProbe({ host: resolved, port: p.port, nonce, sequence: 0 });
@@ -1855,6 +2475,56 @@ async function runTests(opts) {
     else if (row.rateLimited) status = 'RATE-LIMITED (SDG server)';
     else status = `FAIL${row.error ? ' (' + row.error + ')' : ''}`;
     console.log(status);
+  }
+
+  // Spot-check the discovered MTU ceiling on every reachable UDP port
+  // in parallel. Different destination ports = different 5-tuples = no
+  // reply confusion. Populates row.mtuAtCeiling AND the deprecated
+  // row.mtu / row.mtuSweep aliases for backwards compatibility with
+  // pre-v2 report consumers.
+  const discoveredCeiling = (report.mtuDiscovery && report.mtuDiscovery.ok)
+    ? report.mtuDiscovery.ceiling
+    : null;
+  if (discoveredCeiling != null) {
+    const reachableUdpPorts = report.perPort
+      .filter((r) => r.proto === 'udp' && r.reachable)
+      .map((r) => r.port);
+    if (reachableUdpPorts.length > 0) {
+      process.stdout.write(`  MTU spot-check at ${discoveredCeiling} bytes on ${reachableUdpPorts.length} port(s) ... `);
+      let spot;
+      try {
+        spot = await spotCheckCeiling({
+          host: resolved, ports: reachableUdpPorts,
+          nonce, family, ceiling: discoveredCeiling,
+        });
+      } catch (e) {
+        spot = [];
+        console.log(`FAIL (${e.message || e})`);
+      }
+      if (spot.length) console.log('done');
+      const spotByPort = new Map(spot.map((s) => [s.port, s]));
+      for (const r of report.perPort) {
+        if (r.proto !== 'udp') continue;
+        const s = spotByPort.get(r.port);
+        if (!s) continue;
+        r.mtuAtCeiling = { size: s.size, ok: s.ok, rtt: s.rtt, probes: s.probes };
+        // Deprecated single-value alias.
+        r.mtu = { size: s.size, ok: s.ok, rtt: s.rtt };
+        // Deprecated array alias (one element, matches the new shape).
+        r.mtuSweep = [{ size: s.size, ok: s.ok, rtt: s.rtt }];
+        // Flag port-specific shaping when the spot-check fails at a
+        // size the discovery port proved works.
+        if (!s.ok) r.portSpecificShaping = true;
+      }
+    }
+  }
+
+  // Print the "TEST INCONCLUSIVE" banner BEFORE any subsequent phase
+  // (A2S, sustained, etc.) so customers pattern-match on the banner
+  // before they see the sea-of-FAIL in the table. The remaining phases
+  // still run — the report stays as complete as possible for support.
+  if (shouldPrintInconclusive(report)) {
+    printInconclusiveBanner();
   }
 
   if (opts.a2s) {
@@ -2007,6 +2677,42 @@ function printTable(report, { includePublicIp = false } = {}) {
   console.log('================================================================');
   console.log('RESULTS');
   console.log('================================================================');
+  // Summarize the discovered MTU ceiling above the table so the per-port
+  // mtu column has obvious context. The descent ran once on the critical
+  // SE game port (or a fallback); the table column reflects spot-checks
+  // at the discovered ceiling, not independent per-port discoveries.
+  if (report.mtuDiscovery && report.mtuDiscovery.ok && report.mtuDiscovery.ceiling != null) {
+    const d = report.mtuDiscovery;
+    const conf = d.ceilingConfidence === 'medium' ? ' (borderline — see recommendations)' : '';
+    let summary = '';
+    if (Array.isArray(d.descent) && d.descent.length >= 2) {
+      // Find the ceiling pass/total and the failed size immediately above it.
+      const passed = d.descent.find((s) => s.size === d.ceiling);
+      const failedAbove = d.descent.filter((s) => s.size > d.ceiling).slice(-1)[0];
+      if (passed && failedAbove) {
+        const pPass = passed.probes.filter((p) => p && p.ok).length;
+        const pTotal = passed.probes.length;
+        const fPass = failedAbove.probes.filter((p) => p && p.ok).length;
+        const fTotal = failedAbove.probes.length;
+        summary = `  (${pPass}/${pTotal} at ${passed.size}, ${fPass}/${fTotal} at ${failedAbove.size})`;
+      } else if (passed) {
+        const pPass = passed.probes.filter((p) => p && p.ok).length;
+        const pTotal = passed.probes.length;
+        summary = `  (${pPass}/${pTotal} at ${passed.size})`;
+      }
+    }
+    console.log(`MTU ceiling discovered on udp ${d.discoveredOn}: ${d.ceiling} bytes${summary}${conf}`);
+    if (d.fellBackFrom) {
+      console.log(`  (primary discovery port udp ${d.fellBackFrom} was unreachable; fell back to udp ${d.discoveredOn})`);
+    }
+    console.log('');
+  } else if (report.mtuDiscovery && report.mtuDiscovery.skipped) {
+    console.log(`MTU discovery skipped: ${report.mtuDiscovery.reason || 'unknown reason'}`);
+    console.log('');
+  } else if (report.mtuDiscovery && report.mtuDiscovery.ok && report.mtuDiscovery.ceiling == null) {
+    console.log('MTU discovery: no working size found on any discovery target. See recommendations.');
+    console.log('');
+  }
   const header = 'proto  port   cat       reach  rtt(ms)  loss%   mtu      purpose';
   console.log(header);
   console.log('-'.repeat(header.length + 10));
@@ -2018,9 +2724,13 @@ function printTable(report, { includePublicIp = false } = {}) {
     else                               reach = 'FAIL';
     const rtt = r.loss && r.loss.latency.avg != null ? fmt(r.loss.latency.avg) : fmt(r.firstRttMs);
     const loss = r.loss ? fmt(r.loss.lossPct) : '  —  ';
-    // Show the largest MTU size that succeeded, or — if none did — FAIL.
+    // Show the spot-check result at the discovered ceiling. Falls
+    // back to the legacy `r.mtu` / `r.mtuSweep` fields if a consumer
+    // hands this function a pre-v2 report (e.g. from a saved file).
     let mtu = ' — ';
-    if (r.mtuSweep && r.mtuSweep.length) {
+    if (r.mtuAtCeiling) {
+      mtu = r.mtuAtCeiling.ok ? `${r.mtuAtCeiling.size}` : 'FAIL';
+    } else if (r.mtuSweep && r.mtuSweep.length) {
       const lastOk = [...r.mtuSweep].reverse().find(s => s.ok);
       mtu = lastOk ? `${lastOk.size}` : 'FAIL';
     } else if (r.mtu) {
@@ -2159,6 +2869,88 @@ function printTable(report, { includePublicIp = false } = {}) {
   console.log('');
 }
 
+// ---- Inconclusive banner ----
+//
+// Printed by runTests BEFORE the RESULTS table when >50% of attempted
+// UDP ports were unreachable. Goes above the table so customers
+// pattern-match on the inconclusive header before they see a sea of
+// FAILs in the table itself.
+function shouldPrintInconclusive(report) {
+  const { attempted, unreachable } = udpReachabilityStats(report);
+  if (attempted < 3) return false;
+  return (unreachable / attempted) > 0.5;
+}
+
+function printInconclusiveBanner() {
+  console.log('');
+  console.log('================================================================');
+  console.log('TEST INCONCLUSIVE');
+  console.log('================================================================');
+  console.log('Most UDP ports failed to respond. This usually means the SDG');
+  console.log('test server is unreachable, OR your Internet connection is');
+  console.log('severely degraded. Results below are partial — interpret with');
+  console.log('caution and consider rerunning the test in 5 minutes.');
+  console.log('================================================================');
+}
+
+// ---- Recommendations rendering ----
+//
+// Always renders the section header, even on clean runs (the
+// "network-healthy" rule fires as a catch-all). Picks the OS-specific
+// command line based on process.platform — the JSON keeps all three
+// for cross-platform support workflows.
+function platformKeyFor(platform) {
+  if (platform === 'win32') return 'windows';
+  if (platform === 'darwin') return 'macos';
+  return 'linux';
+}
+
+function severityTag(sev) {
+  if (sev === 'critical') return '[CRITICAL]';
+  if (sev === 'warning')  return '[WARNING] ';
+  return '[INFO]    ';
+}
+
+function printRecommendations(report, { platform = process.platform } = {}) {
+  const recs = Array.isArray(report.recommendations) ? report.recommendations : [];
+  console.log('');
+  console.log('================================================================');
+  console.log('RECOMMENDATIONS');
+  console.log('================================================================');
+  if (recs.length === 0) {
+    console.log('[INFO]     Recommendation engine produced no output. (This is a bug.)');
+    console.log('');
+    return;
+  }
+  const platKey = platformKeyFor(platform);
+  for (const r of recs) {
+    console.log('');
+    console.log(`${severityTag(r.severity)} ${r.title}`);
+    if (r.detail) {
+      // Wrap detail to ~78 columns for readability.
+      const words = r.detail.split(/\s+/);
+      let line = '  ';
+      for (const w of words) {
+        if (line.length + w.length + 1 > 78) {
+          console.log(line);
+          line = '  ' + w;
+        } else {
+          line = line === '  ' ? '  ' + w : line + ' ' + w;
+        }
+      }
+      if (line.trim()) console.log(line);
+    }
+    if (r.action && r.action.summary) {
+      console.log(`  Action: ${r.action.summary}`);
+      const cmds = r.action.platformCommands;
+      if (cmds && cmds[platKey]) {
+        console.log(`  Command (${platKey}): ${cmds[platKey]}`);
+      }
+    }
+  }
+  console.log('');
+}
+
 // Apply privacy redaction to a report before writing it to disk.
 // Both the console output (see printTable) and the JSON file redact
 // the host portion of any reflected public IP by default; pass
@@ -2202,12 +2994,16 @@ async function main() {
   console.log(`Burst test  : ${opts.burst ? 'yes (udp ' + BURST_PORT + ')' : 'no'}`);
   console.log(`Source fan-out : ${opts.sourcePortFanout ? `yes (${FANOUT_SOCKET_COUNT} sockets × ${FANOUT_PACKETS_EACH} probes)` : 'no'}`);
   console.log(`Payload shapes : ${opts.payloadShape ? 'yes (3 patterns)' : 'no'}`);
+  console.log(`MTU discovery : ${opts.mtuDiscovery !== false ? `yes (descent from 1472)` : 'no'}`);
   console.log(`Real server : ${opts.realServer || '(none)'}`);
   console.log(`JSON output : ${opts.json || '(none — console only)'}`);
   // Wall-clock estimate so the user knows whether to make coffee. Sum
   // of the most expensive components: per-port loss tests, sustained,
   // nat-idle (dominant when present), burst, fan-out, payload-shape.
-  const estSec = (opts.ports ? opts.ports.length : PORTS.length) * 6
+  // Per-port factor dropped from 6 to 4 when the legacy per-port MTU
+  // sweep moved to a single adaptive discovery + parallel spot-check.
+  const estSec = (opts.ports ? opts.ports.length : PORTS.length) * 4
+               + (opts.mtuDiscovery !== false ? 6 : 0)
                + (opts.sustained ? Math.round(opts.duration / 1000) + 2 : 0)
                + (opts.a2s ? 3 : 0)
                + (opts.natIdle ? opts.natIdle.reduce((a, b) => a + b, 0) + opts.natIdle.length * 1 : 0)
@@ -2230,6 +3026,8 @@ async function main() {
 
   const report = await runTests(opts);
   printTable(report, { includePublicIp: opts.includePublicIp });
+  report.recommendations = buildRecommendations(report);
+  printRecommendations(report, { platform: process.platform });
 
   if (opts.json) {
     const jsonReport = redactReportForJson(report, opts.includePublicIp);
@@ -2253,4 +3051,16 @@ module.exports = {
   // Phase 2 pure helpers exposed for unit tests.
   lossBurstHistogram, countReorderings,
   classifyFanout, classifyPayloadShape,
+  // Adaptive MTU discovery + recommendation engine helpers.
+  decideNextMtuStep, recommendedMtuFor, udpReachabilityStats,
+  shouldPrintInconclusive,
+  buildRecommendations, RULES,
+  ruleTestInconclusive, ruleMtuSevere, ruleMtuCapped, ruleMtuMarginal,
+  ruleCgnat464xlat, ruleDpiFingerprint, rulePerFlowShaping,
+  ruleNatIdleShort, ruleSymmetricNat, ruleNetworkHealthy,
+  // Constants exposed so tests can use the canonical descent ladder
+  // without re-declaring it.
+  MTU_DESCENT_BYTES, MTU_DESCENT_BYTES_V6, MTU_FALLBACK_PORTS,
+  MTU_PROBES_PER_SIZE, MTU_PASS_THRESHOLD,
+  MTU_TIEBREAKER_TOTAL, MTU_TIEBREAKER_PASS,
 };

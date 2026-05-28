@@ -1,0 +1,39 @@
+{
+  "version": 2,
+  "tool": "sdg-connection-test client",
+  "startedAt": "2026-05-28T05:22:01.662Z",
+  "host": "38.107.232.39",
+  "resolved": "38.107.232.39",
+  "family": 4,
+  "nonceHex": "8cdef21cffce39fa",
+  "capabilities": {
+    "ok": true,
+    "reason": null,
+    "capabilities": { "raw": 7, "reflection": true, "bidirectional": true, "natIdleAware": true },
+    "isV1Server": false
+  },
+  "mtuDiscovery": {
+    "ok": true,
+    "discoveredOn": 27016,
+    "descent": [
+      { "size": 1472, "probes": [ { "ok": false, "rtt": null }, { "ok": false, "rtt": null }, { "ok": false, "rtt": null } ] },
+      { "size": 1400, "probes": [ { "ok": false, "rtt": null }, { "ok": false, "rtt": null }, { "ok": false, "rtt": null } ] },
+      { "size": 1300, "probes": [ { "ok": true, "rtt": 47.5 }, { "ok": true, "rtt": 48.1 }, { "ok": true, "rtt": 46.9 } ] }
+    ],
+    "ceiling": 1300,
+    "ceilingConfidence": "high"
+  },
+  "perPort": [
+    { "proto": "udp", "port": 27016, "category": "critical", "purpose": "SE game", "reachable": true, "loss": { "lossPct": 0 }, "mtuAtCeiling": { "size": 1300, "ok": true, "rtt": 47.5 } },
+    { "proto": "udp", "port": 8766,  "category": "critical", "purpose": "Steam",   "reachable": true, "loss": { "lossPct": 0 }, "mtuAtCeiling": { "size": 1300, "ok": true, "rtt": 48.2 } },
+    { "proto": "udp", "port": 27015, "category": "critical", "purpose": "A2S",     "reachable": true, "loss": { "lossPct": 0 }, "mtuAtCeiling": { "size": 1300, "ok": true, "rtt": 49.0 } },
+    { "proto": "udp", "port": 27017, "category": "game",     "purpose": "SE alt",  "reachable": true, "loss": { "lossPct": 0 }, "mtuAtCeiling": { "size": 1300, "ok": true, "rtt": 47.3 } },
+    { "proto": "udp", "port": 27020, "category": "game",     "purpose": "Torch",   "reachable": true, "loss": { "lossPct": 0 }, "mtuAtCeiling": { "size": 1300, "ok": true, "rtt": 47.0 } },
+    { "proto": "tcp", "port": 27015, "category": "steam",    "purpose": "Steam tcp","reachable": true }
+  ],
+  "natIdle": { "largestSurvivedSec": 60, "reflectionUsed": true },
+  "natType": { "ok": true, "verdict": { "kind": "cone", "reason": "stable port" } },
+  "sourcePortFanout": { "verdict": { "kind": "clean", "reason": "no per-flow shaping" } },
+  "payloadShape": { "verdict": { "kind": "clean", "reason": "all shapes <2% loss" } },
+  "deprecated": ["perPort[].mtuSweep"]
+}

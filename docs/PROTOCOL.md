@@ -60,7 +60,9 @@ Offset  Size  Field              Description
                                  process.hrtime.bigint() value here purely
                                  as a liveness indicator. Not a wall clock.
 36      N     payload / padding  For type 1/2/8 and stream_data: zero padding
-                                 (0..~1400 bytes). For type 6/7: a 16-byte
+                                 (0..1472 bytes for the adaptive MTU
+                                 descent, lower for routine probes).
+                                 For type 6/7: a 16-byte
                                  HMAC challenge token. Never contains any
                                  data derived from the host.
 ```
@@ -195,8 +197,8 @@ source socket to **two different** destination ports (e.g. 27016 and
   trivially. Reported as "no NAT (IPv6)" rather than "cone".
 
 Reflected source IPs may legitimately differ even on the same socket
-when the carrier rotates CGNAT egress IPs (T-Mobile 5G Home does
-this). The classifier only compares ports.
+when the carrier rotates CGNAT egress IPs (a common pattern on 5G
+home internet). The classifier only compares ports.
 
 ### NAT idle-timeout probe (no protocol change)
 
@@ -222,8 +224,9 @@ appeared to work in both cases.
 The legacy sustained test (§2) emits server-to-client traffic only.
 That measures the customer's downlink path. Phase 1 adds an opt-in
 upstream (and combined) variant to measure the uplink path
-independently — T-Mobile 5G Home's uplink is a separately-configured
-device with its own shaping behavior.
+independently — 5G home internet uplinks are commonly a separately-
+configured shaping path with its own behavior, invisible to a
+downstream-only test.
 
 ### Direction signaling
 

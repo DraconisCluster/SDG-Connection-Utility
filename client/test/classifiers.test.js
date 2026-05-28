@@ -28,9 +28,10 @@ test('classifyNatType: different v4 ports → symmetric NAT', () => {
 });
 
 test('classifyNatType: equal v4 ports with rotated v4 IPs (CGNAT egress rotation) is still cone', () => {
-  // T-Mobile 5G Home rotates egress IPs across a /20. Two probes
-  // seconds apart can come back with different reflected addresses
-  // even on a stable port. Only port matters for cone vs symmetric.
+  // 5G home internet carriers rotate CGNAT egress IPs across a /20.
+  // Two probes seconds apart can come back with different reflected
+  // addresses even on a stable port. Only port matters for cone vs
+  // symmetric.
   const v = classifyNatType(
     refV4(45678, '172.58.4.10'),
     refV4(45678, '172.58.4.42'),
